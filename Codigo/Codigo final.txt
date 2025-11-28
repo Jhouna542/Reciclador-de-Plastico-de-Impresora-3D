@@ -1,0 +1,171 @@
+#define F_CPU 32000000UL
+#include <avr/io.h>
+#include <util/delay.h>
+#include <stdbool.h>
+#include <math.h>
+
+/* Parámetros del termistor */
+#define BETA 3950.0
+#define T0_K 298.15
+#define R0 100000.0
+#define SERIES_R 100000.0
+#define ADC_MAX 4095.0
+#define VREF_VOLTS 3.3
+
+/* Histeresis */
+#define TEMP_LOWER 195.0
+#define TEMP_UPPER 205.0
+
+/* Pines */
+#define TEMP_ADC_CH 0
+#define SPEED_ADC_CH 1
+#define PIN_HEAT_bm PIN0_bm
+#define PIN_EN_bm PIN2_bm
+#define PIN_STEP_bm PIN3_bm
+#define PIN_DIR_bm PIN4_bm
+#define PIN_LED_bm PIN5_bm
+#define PIN_BUT1_bm PIN7_bm
+
+volatile bool motor_active = false;
+bool heater_on = false;
+float set_temperature = 200.0;
+float temperature_read = 0.0;
+
+void system_clock_init(void);
+void adc_init(void);
+uint16_t adc_read(uint8_t ch);
+float read_temperature(void);
+void io_init(void);
+void motor_init(void);
+void motor_update_speed(uint16_t adc_val);
+void button_check(void);
+void heat_control(float temp);
+
+int main(void) {
+	system_clock_init();
+	adc_init();
+	io_init();
+	motor_init();
+
+	while (1) {
+		button_check();
+		temperature_read = read_temperature();
+		heat_control(temperature_read);
+
+		if (motor_active) {
+			uint16_t adc_speed = adc_read(SPEED_ADC_CH);
+			motor_update_speed(adc_speed);
+		}
+
+		_delay_ms(500);
+	}
+}
+
+void system_clock_init(void) {}
+
+void adc_init(void) {
+	ADCA.REFCTRL = ADC_REFSEL_INT1V_gc;
+	ADCA.PRESCALER = ADC_PRESCALER_DIV512_gc;
+	ADCA.CTRLB = ADC_RESOLUTION_12BIT_gc;
+	ADCA.CTRLA = ADC_ENABLE_bm;
+	ADCA.CH0.CTRL = ADC_CH_INPUTMODE_SINGLEENDED_gc;
+	ADCA.CH0.MUXCTRL = TEMP_ADC_CH;
+}
+
+uint16_t adc_read(uint8_t ch) {
+    ADCA.CH0.MUXCTRL = ch;
+    ADCA.CH0.CTRL |= ADC_CH_START_bm;
+
+    /* Esperar fin de conversión: usar la macro estándar del DFP (ADC_CH_CHIF_bm).
+       Si tu toolchain da error con ADC_CH_CHIF_bm, probá con ADC_CH0IF_bm. */
+#if defined(ADC_CH_CHIF_bm)
+    while (!(ADCA.CH0.INTFLAGS & ADC_CH_CHIF_bm));
+    ADCA.CH0.INTFLAGS = ADC_CH_CHIF_bm;  // limpiar flag
+#elif defined(ADC_CH0IF_bm)
+    while (!(ADCA.CH0.INTFLAGS & ADC_CH0IF_bm));
+    ADCA.CH0.INTFLAGS = ADC_CH0IF_bm;   // limpiar flag
+#else
+    /* Fallback: si ninguna macro existe, limpiar el registro completo (menos ideal,
+       pero evita código no compilable). Descomentar si lo necesitás:
+    while (!(ADCA.CH0.INTFLAGS & 0x01)); // ejemplo, NO recomendado sin confirmar
+    ADCA.CH0.INTFLAGS = ADCA.CH0.INTFLAGS; */
+#endif
+
+    return ADCA.CH0.RES;
+}
+
+float read_temperature(void) {
+	uint16_t raw = adc_read(TEMP_ADC_CH);
+	float voltage = (raw * VREF_VOLTS) / ADC_MAX;
+	if (voltage <= 0.0f) voltage = 0.0001f;
+
+	float resistance = SERIES_R * ((VREF_VOLTS / voltage) - 1.0f);
+	float tempK = 1.0f / ((1.0f / T0_K) + (1.0f / BETA) * logf(resistance / R0));
+	return tempK - 273.15f;
+}
+
+void io_init(void) {
+    /* Pines de salida */
+    PORTC.DIRSET = PIN_HEAT_bm | PIN_EN_bm | PIN_STEP_bm | PIN_DIR_bm | PIN_LED_bm;
+    PORTC.OUTCLR = PIN_HEAT_bm | PIN_EN_bm | PIN_STEP_bm | PIN_LED_bm;
+
+    /* Botón como entrada y pull-up + detección de flancos.
+       En XMEGA modernos la configuración de pull-up usa PORT_OPC_PULLUP_gc.
+       Si tu device pack reconoce PORT_PULLUPEN_bm y NO PORT_OPC_PULLUP_gc,
+       reemplazá la segunda parte por PORT_PULLUPEN_bm. */
+#if defined(PORT_OPC_PULLUP_gc)
+    PORTE.DIRCLR = PIN_BUT1_bm; /* entrada */
+    PORTE.PIN7CTRL = PORT_ISC_BOTHEDGES_gc | PORT_OPC_PULLUP_gc;
+#elif defined(PORT_PULLUPEN_bm)
+    PORTE.DIRCLR = PIN_BUT1_bm;
+    PORTE.PIN7CTRL = PORT_ISC_BOTHEDGES_gc | PORT_PULLUPEN_bm;
+#else
+    /* Fallback mínimo: solo input y detectar both edges */
+    PORTE.DIRCLR = PIN_BUT1_bm;
+    PORTE.PIN7CTRL = PORT_ISC_BOTHEDGES_gc;
+#endif
+}
+
+
+void motor_init(void) {}
+
+void motor_update_speed(uint16_t adc_val) {
+	uint32_t speed = adc_val;
+	if (speed < 1000) speed = 1000;
+	if (speed > 5000) speed = 5000;
+
+	PORTC.OUTSET = PIN_EN_bm | PIN_LED_bm;
+
+	PORTC.OUTSET = PIN_STEP_bm;
+	for (uint32_t i = 0; i < speed; i++) {
+		_asm_ _volatile_("nop");
+	}
+
+	PORTC.OUTCLR = PIN_STEP_bm;
+	for (uint32_t i = 0; i < speed; i++) {
+		_asm_ _volatile_("nop")
+
+void button_check(void) {
+	static bool last_state = true;
+	bool pressed = !(PORTE.IN & PIN_BUT1_bm);
+	if (pressed && last_state) {
+		motor_active = !motor_active;
+		last_state = false;
+		} else if (!pressed && !last_state) {
+		last_state = true;
+	}
+}
+
+void heat_control(float temp) {
+	if (heater_on) {
+		if (temp >= TEMP_UPPER) {
+			PORTC.OUTCLR = PIN_HEAT_bm;
+			heater_on = false;
+		}
+		} else {
+		if (temp <= TEMP_LOWER) {
+			PORTC.OUTSET = PIN_HEAT_bm;
+			heater_on = true;
+		}
+	}
+}

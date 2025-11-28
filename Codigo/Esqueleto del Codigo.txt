@@ -1,0 +1,180 @@
+.section .data
+
+.section .text
+.global asm_function
+
+asm_function:
+;---------------------------------------
+; Simulación de sistema temperatura + motor
+; Funciona en AVR Simulator
+;---------------------------------------
+.set TEMP_LOWER = 1950 
+.set TEMP_UPPER = 2050
+.set PIN_HEAT   = 0x01
+.set PIN_EN     = 0x04
+.set PIN_STEP   = 0x08
+.set PIN_LED    = 0x10
+
+;---------------------------------------
+; Variables en SRAM
+;---------------------------------------
+.dseg
+motor_active:   .byte 1
+heater_on:      .byte 1
+temperature:    .word 0       ; temperatura simulada en décimas
+lcd_buffer:     .byte 16      ; buffer simulado
+
+;---------------------------------------
+; Inicio
+;---------------------------------------
+.cseg
+.org 0x0000
+rjmp RESET
+
+;---------------------------------------
+RESET:
+; Inicialización de puertos
+ldi r16, 0xFF
+out DDRC, r16       ; todo PORTC como salida
+ldi r16, 0x00
+out PORTC, r16      ; inicializamos en 0
+
+; Inicializamos variables
+ldi r16, 0
+sts motor_active, r16
+sts heater_on, r16
+ldi r16, low(TEMP_LOWER) ; empezamos con temp = TEMP_LOWER
+sts temperature, r16
+ldi r16, high(TEMP_LOWER)
+sts temperature+1, r16
+
+rjmp MAIN_LOOP
+
+;---------------------------------------
+; MAIN LOOP
+;---------------------------------------
+MAIN_LOOP:
+
+; --- Simular lectura de temperatura ---
+; Incrementamos 1 décima por ciclo hasta TEMP_UPPER y luego decrementamos
+lds r16, temperature
+lds r17, temperature+1
+; r17:r16 = temperature
+; comparo con TEMP_UPPER
+ldi r18, high(TEMP_UPPER)
+ldi r19, low(TEMP_UPPER)
+cp r17, r18
+cpc r16, r19
+brge TEMP_DECREASE
+; si menor -> incrementar
+adiw r16,1
+rjmp TEMP_OK
+TEMP_DECREASE:
+sbiw r16,1
+TEMP_OK:
+sts temperature, r16
+sts temperature+1, r17
+
+; --- Heat control con histéresis ---
+lds r16, heater_on
+cpi r16, 0
+breq CHECK_LOWER
+; heater_on = 1 -> si temp >= TEMP_UPPER -> apagar
+lds r18, temperature
+lds r19, temperature+1
+ldi r20, low(TEMP_UPPER)
+ldi r21, high(TEMP_UPPER)
+cp r19, r21
+cpc r18, r20
+brlt SKIP_OFF
+; apagar calefactor
+ldi r16, 0
+sts heater_on, r16
+; Limpiamos pin calefactor
+in r16, PORTC
+andi r16, ~PIN_HEAT
+out PORTC, r16
+SKIP_OFF:
+rjmp AFTER_HEAT
+
+CHECK_LOWER:
+; heater_on = 0 -> si temp <= TEMP_LOWER -> encender
+lds r18, temperature
+lds r19, temperature+1
+ldi r20, low(TEMP_LOWER)
+ldi r21, high(TEMP_LOWER)
+cp r19, r21
+cpc r18, r20
+brlt SKIP_ON
+; encender calefactor
+ldi r16, 1
+sts heater_on, r16
+; Set pin calefactor
+in r16, PORTC
+ori r16, PIN_HEAT
+out PORTC, r16
+SKIP_ON:
+AFTER_HEAT:
+
+; --- Motor ---
+lds r16, motor_active
+cpi r16, 0
+breq SKIP_MOTOR
+; Simular paso motor: toggle STEP
+in r16, PORTC
+eor r16, PIN_STEP
+out PORTC, r16
+; LED motor encendido
+in r16, PORTC
+ori r16, PIN_LED
+out PORTC, r16
+rjmp AFTER_MOTOR
+SKIP_MOTOR:
+; Motor apagado -> LED apagado
+in r16, PORTC
+andi r16, ~PIN_LED
+out PORTC, r16
+AFTER_MOTOR:
+
+; --- Simulación LCD ---
+; copiamos temperatura a buffer ascii "xxx.x"
+; Para simplicidad solo llenamos 0..9
+ldi r30, lo8(lcd_buffer)
+ldi r31, hi8(lcd_buffer)
+ldi r16, '2'  ; ejemplo
+st Z+, r16
+ldi r16, '0'
+st Z+, r16
+ldi r16, '0'
+st Z+, r16
+ldi r16, '.'
+st Z+, r16
+ldi r16, '0'
+st Z+, r16
+ldi r16, 0
+st Z+, r16
+
+; --- Delay ---
+ldi r16, low(500)
+ldi r17, high(500)
+rcall DELAY_MS
+
+rjmp MAIN_LOOP
+
+;---------------------------------------
+; Rutina de delay simple (aprox 1ms por iteración)
+;---------------------------------------
+DELAY_MS:
+; r17:r16 = count ms
+; para simulación basta NOPs
+; bucle simple
+DELAY_LOOP:
+nop
+dec r16
+brne DELAY_LOOP
+dec r17
+brne DELAY_LOOP
+ret
+
+
+.end
